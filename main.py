@@ -1,9 +1,7 @@
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 import aiohttp
-import asyncio
-from email.utils import parsedate_to_datetime
 
 from aiogram import Bot, Dispatcher, executor, types
 
@@ -26,10 +24,6 @@ LP_SERVICE = os.getenv("LP_SERVICE", "TelegramSupportBot").strip()
 
 LP_BASE = "https://direct.lptracker.ru"
 LP_PROJECT_ID = int(LP_PROJECT_ID_RAW) if LP_PROJECT_ID_RAW.isdigit() else None
-
-# Включить попытку писать в "чат" (если endpoint доступен).
-# Если LPTracker его не поддерживает — бот сам откатится на комментарии.
-LP_TRY_CHAT_WRITE = os.getenv("LP_TRY_CHAT_WRITE", "1").strip() == "1"
 
 # ===== DB =====
 DB_PATH = "links.sqlite"
@@ -60,24 +54,6 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             thread_id INTEGER NOT NULL,
             created_at TEXT NOT NULL
-        )
-    """)
-
-    # Для polling комментариев: хранить последний обработанный comment_id по лиду
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lead_state (
-            lead_id INTEGER PRIMARY KEY,
-            last_comment_id INTEGER NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-
-    # Для polling chatHistory: хранить последний обработанный timestamp (ms) по лиду
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lead_chat_state (
-            lead_id INTEGER PRIMARY KEY,
-            last_ts_ms INTEGER NOT NULL,
-            updated_at TEXT NOT NULL
         )
     """)
 
@@ -123,64 +99,6 @@ def get_lead_id_by_user_id(user_id: int):
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
-
-
-def get_user_id_by_lead_id(lead_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM crm_links WHERE lead_id = ?", (lead_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def get_all_lead_ids():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT lead_id FROM crm_links")
-    rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows] if rows else []
-
-
-def get_last_comment_id(lead_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT last_comment_id FROM lead_state WHERE lead_id = ?", (lead_id,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
-
-
-def set_last_comment_id(lead_id: int, last_comment_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO lead_state(lead_id, last_comment_id, updated_at) VALUES (?, ?, ?)",
-        (int(lead_id), int(last_comment_id), datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_last_chat_ts_ms(lead_id: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT last_ts_ms FROM lead_chat_state WHERE lead_id = ?", (lead_id,))
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0]) if row else 0
-
-
-def set_last_chat_ts_ms(lead_id: int, last_ts_ms: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO lead_chat_state(lead_id, last_ts_ms, updated_at) VALUES (?, ?, ?)",
-        (int(lead_id), int(last_ts_ms), datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
 
 
 def save_thread(user_id: int, thread_id: int):
@@ -236,7 +154,7 @@ async def lpt_request(session: aiohttp.ClientSession, method: str, path: str, js
         data = await resp.json(content_type=None)
 
     # token expired -> relogin once
-    if isinstance(data, dict) and data.get("status") == "error":
+    if data.get("status") == "error":
         errors = data.get("errors") or []
         if any(e.get("code") == 401 for e in errors):
             await lpt_login(session)
@@ -248,13 +166,18 @@ async def lpt_request(session: aiohttp.ClientSession, method: str, path: str, js
 
 
 async def lpt_get_contact_field_id_by_name(session: aiohttp.ClientSession, field_name: str) -> int | None:
+    """
+    Находит ID кастомного поля контакта по названию (например "Telegram").
+    Кешируем значение, чтобы не дергать API на каждое сообщение.
+    """
     global _lp_telegram_field_id
 
+    # уже искали: _lp_telegram_field_id = int (нашли) или 0 (не нашли)
     if _lp_telegram_field_id is not None:
         return _lp_telegram_field_id if _lp_telegram_field_id != 0 else None
 
     data = await lpt_request(session, "GET", f"/project/{LP_PROJECT_ID}/fields", json_body=None)
-    if not isinstance(data, dict) or data.get("status") != "success":
+    if not data or data.get("status") != "success":
         _lp_telegram_field_id = 0
         return None
 
@@ -272,12 +195,19 @@ async def lpt_get_contact_field_id_by_name(session: aiohttp.ClientSession, field
 
 
 async def lpt_create_lead(session: aiohttp.ClientSession, tg_user: types.User) -> int:
+    """
+    ВАЖНОЕ ИСПРАВЛЕНИЕ:
+    LPTracker требует contact.details (email/phone). Поэтому кладем details внутрь contact.
+    Также пишем username в кастомное поле контакта "Telegram" (если такое поле есть в проекте).
+    """
     lead_name = f"Telegram: {(tg_user.full_name or 'Клиент').strip()}"
 
+    # обязательное: contact.details
     details_list = [
         {"type": "email", "data": f"tg{tg_user.id}@telegram.invalid"}
     ]
 
+    # кастомное поле контакта "Telegram" (как у тебя в карточке)
     contact_fields = {}
     if tg_user.username:
         telegram_field_id = await lpt_get_contact_field_id_by_name(session, "Telegram")
@@ -297,47 +227,16 @@ async def lpt_create_lead(session: aiohttp.ClientSession, tg_user: types.User) -
         body["contact"]["fields"] = contact_fields
 
     data = await lpt_request(session, "POST", "/lead", json_body=body)
-    if not isinstance(data, dict) or data.get("status") != "success":
+    if data.get("status") != "success":
         raise RuntimeError(f"LPTracker create lead error: {data}")
 
     return int(data["result"]["id"])
 
 
 async def lpt_add_comment(session: aiohttp.ClientSession, lead_id: int, text: str):
-    # POST /lead/[lead_id]/comment (документировано)
     data = await lpt_request(session, "POST", f"/lead/{lead_id}/comment", json_body={"text": text})
-    if not isinstance(data, dict) or data.get("status") != "success":
+    if data.get("status") != "success":
         raise RuntimeError(f"LPTracker add comment error: {data}")
-
-
-async def lpt_get_comments(session: aiohttp.ClientSession, lead_id: int):
-    # GET /lead/{lead_id}/comments
-    data = await lpt_request(session, "GET", f"/lead/{lead_id}/comments", json_body=None)
-    if not isinstance(data, dict) or data.get("status") != "success":
-        raise RuntimeError(f"LPTracker get comments error: {data}")
-    return data.get("result") or []
-
-
-async def lpt_get_chat_history(session: aiohttp.ClientSession, lead_id: int):
-    # GET lead/chatHistory/[lead_id] (документировано)
-    data = await lpt_request(session, "GET", f"/lead/chatHistory/{lead_id}", json_body=None)
-    if not isinstance(data, dict) or data.get("status") != "success":
-        raise RuntimeError(f"LPTracker get chatHistory error: {data}")
-    return data.get("result") or []
-
-
-async def lpt_add_chat_message(session: aiohttp.ClientSession, lead_id: int, text: str, is_income: bool):
-    """
-    В документации нет метода добавления сообщения в чат.
-    Но иногда в LPTracker он существует недокументированно.
-    Поэтому:
-      - пробуем POST /lead/chatHistory/{lead_id}
-      - если не получилось — кидаем исключение, вызывающий код откатится на комментарии.
-    """
-    body = {"message": text, "isIncome": bool(is_income)}
-    data = await lpt_request(session, "POST", f"/lead/chatHistory/{lead_id}", json_body=body)
-    if not isinstance(data, dict) or data.get("status") != "success":
-        raise RuntimeError(f"LPTracker add chat message error: {data}")
 
 
 # ===== Telegram Topics helper =====
@@ -360,6 +259,7 @@ async def ensure_topic_for_user(user: types.User) -> int:
     if thread_id:
         return thread_id
 
+    # ВАЖНО: только имя
     title = (user.first_name or user.full_name or "Клиент").strip()
     thread_id = await tg_create_forum_topic(GROUP_ID, title)
     save_thread(user.id, thread_id)
@@ -371,19 +271,6 @@ bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
 
-async def safe_send_group(text: str, thread_id: int | None = None):
-    """
-    Безопасная отправка в группу: если thread_id None/битый — отправляем в общий чат.
-    """
-    try:
-        if thread_id:
-            return await bot.send_message(chat_id=GROUP_ID, message_thread_id=thread_id, text=text)
-        return await bot.send_message(chat_id=GROUP_ID, text=text)
-    except Exception:
-        # совсем уже молча, чтобы не зациклить
-        return None
-
-
 def client_header(user: types.User) -> str:
     username = f"@{user.username}" if user.username else "нет"
     return (
@@ -391,17 +278,6 @@ def client_header(user: types.User) -> str:
         f"🔗 <b>Username</b>: {username}\n"
         f"🆔 <b>ID</b>: <code>{user.id}</code>\n"
         f"✍️ <i>Отвечайте на сообщение цитатой</i>"
-    )
-
-
-def is_our_incoming_comment(text: str) -> bool:
-    if not text:
-        return False
-    t = text.strip().lower()
-    return (
-        t.startswith("telegram сообщение от клиента:".lower())
-        or t.startswith("telegram: клиент прислал".lower())
-        or t.startswith("telegram: клиент прислал вложение".lower())
     )
 
 
@@ -417,13 +293,14 @@ async def from_client_to_group(message: types.Message):
     try:
         thread_id = await ensure_topic_for_user(message.from_user)
     except Exception as e:
-        await safe_send_group(
-            f"⚠️ Не удалось создать топик. Проверь, что в группе включены Темы.\n<code>{e}</code>"
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            text=f"⚠️ Не удалось создать топик. Проверь, что в группе включены Темы.\n<code>{e}</code>"
         )
 
     header = client_header(message.from_user)
 
-    # send to topic (текущая рабочая логика — не трогаю)
+    # send to topic
     if message.text:
         sent = await bot.send_message(
             chat_id=GROUP_ID,
@@ -452,38 +329,21 @@ async def from_client_to_group(message: types.Message):
 
                 if message.text:
                     username = f"@{message.from_user.username}" if message.from_user.username else "нет"
-                    payload_text = (
+                    comment = (
                         f"Telegram сообщение от клиента:\n"
                         f"Имя: {message.from_user.full_name}\n"
                         f"Username: {username}\n"
                         f"Telegram ID: {message.from_user.id}\n\n"
                         f"{message.text}"
                     )
-
-                    # 1) пробуем записать как "сообщение" (если поддерживается)
-                    if LP_TRY_CHAT_WRITE:
-                        try:
-                            await lpt_add_chat_message(session, lead_id, payload_text, is_income=True)
-                        except Exception:
-                            # 2) fallback на комментарий (документировано)
-                            await lpt_add_comment(session, lead_id, payload_text)
-                    else:
-                        await lpt_add_comment(session, lead_id, payload_text)
-
+                    await lpt_add_comment(session, lead_id, comment)
                 else:
-                    note = "Telegram: клиент прислал вложение/медиа (файл)."
-                    if LP_TRY_CHAT_WRITE:
-                        try:
-                            await lpt_add_chat_message(session, lead_id, note, is_income=True)
-                        except Exception:
-                            await lpt_add_comment(session, lead_id, note)
-                    else:
-                        await lpt_add_comment(session, lead_id, note)
-
+                    await lpt_add_comment(session, lead_id, "Telegram: клиент прислал вложение/медиа (файл).")
         except Exception as e:
-            await safe_send_group(
-                f"⚠️ <b>LPTracker:</b> не удалось записать сообщение в CRM.\n<code>{e}</code>",
-                thread_id=thread_id
+            await bot.send_message(
+                chat_id=GROUP_ID,
+                message_thread_id=thread_id,
+                text=f"⚠️ <b>LPTracker:</b> не удалось записать сообщение в CRM.\n<code>{e}</code>"
             )
 
 
@@ -492,150 +352,35 @@ async def from_group_to_client(message: types.Message):
     # работаем только в нашей группе
     if message.chat.id != GROUP_ID:
         return
-
+    # игнорируем сообщения от ботов (в т.ч. от нашего бота),
+    # иначе бот будет ругаться сам на себя
     if message.from_user and message.from_user.is_bot:
         return
 
+    # не реагируем на команды типа /id
     if message.text and message.text.strip().startswith("/"):
         return
 
+    # если менеджер написал БЕЗ reply — показываем предупреждение
     if not message.reply_to_message:
-        warning_text = "❗ Сообщение клиенту не отправлено. Отвечать клиенту нужно через цитату. Отправьте ответ повторно через цитирование сообщения клиента"
+        warning_text = "❗ Сообщение клиенту не отправлено. Отвечать клиенту нужно через цитату. Отправьте свой ответ повторно через цитирование сообщения клиента"
         await message.reply(warning_text)
         return
 
+    # если ответили не на сообщение клиента
     replied_id = message.reply_to_message.message_id
     user_id = get_user_id_by_group_message_id(replied_id)
     if not user_id:
-        await message.reply("❗ Сообщение клиенту не отправлено. Отвечать клиенту нужно через цитату. Отправьте ответ повторно через цитирование сообщения клиента")
+        await message.reply("❗ Сообщение клиенту не отправлено. Отвечать клиенту нужно через цитату. Отправьте свой ответ повторно через цитирование сообщения клиента")
         return
 
+    # отправляем клиенту
     if message.text:
         await bot.send_message(chat_id=user_id, text=message.text)
     else:
         await message.copy_to(chat_id=user_id)
 
 
-def _parse_lpt_date_to_ms(date_str: str) -> int:
-    """
-    chatHistory возвращает дату строкой типа:
-      'Thu, 19 May 2022 15:42:01 +0000'
-    Переводим в timestamp ms.
-    """
-    if not date_str:
-        return 0
-    try:
-        dt = parsedate_to_datetime(date_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1000)
-    except Exception:
-        return 0
-
-
-async def lpt_polling_loop():
-    """
-    Polling:
-      A) комментарии (старый путь) — если менеджеры отвечают комментарием
-      B) chatHistory — если менеджеры отвечают в "чате" лида
-    """
-    POLL_SECONDS = 8
-
-    while True:
-        try:
-            if not lpt_enabled():
-                await asyncio.sleep(POLL_SECONDS)
-                continue
-
-            lead_ids = get_all_lead_ids()
-            if not lead_ids:
-                await asyncio.sleep(POLL_SECONDS)
-                continue
-
-            async with aiohttp.ClientSession() as session:
-                for lead_id in lead_ids:
-                    user_id = get_user_id_by_lead_id(lead_id)
-                    if not user_id:
-                        continue
-
-                    # ===== A) COMMENTS =====
-                    last_seen_comment = get_last_comment_id(lead_id)
-                    try:
-                        comments = await lpt_get_comments(session, lead_id)
-                    except Exception:
-                        comments = []
-
-                    if comments:
-                        new_comments = []
-                        for c in comments:
-                            try:
-                                cid = int(c.get("id", 0))
-                            except Exception:
-                                cid = 0
-                            if cid > last_seen_comment:
-                                text = (c.get("text", "") or "").strip()
-                                new_comments.append((cid, text))
-
-                        if new_comments:
-                            new_comments.sort(key=lambda x: x[0])
-                            max_sent = last_seen_comment
-
-                            for cid, text in new_comments:
-                                if not text:
-                                    max_sent = max(max_sent, cid)
-                                    continue
-                                # игнорим входящие, которые добавляет бот
-                                if is_our_incoming_comment(text):
-                                    max_sent = max(max_sent, cid)
-                                    continue
-                                await bot.send_message(chat_id=user_id, text=text)
-                                max_sent = max(max_sent, cid)
-
-                            if max_sent > last_seen_comment:
-                                set_last_comment_id(lead_id, max_sent)
-
-                    # ===== B) CHAT HISTORY =====
-                    last_ts_ms = get_last_chat_ts_ms(lead_id)
-                    try:
-                        chat_items = await lpt_get_chat_history(session, lead_id)
-                    except Exception:
-                        chat_items = []
-
-                    if chat_items:
-                        new_outgoing = []
-                        for item in chat_items:
-                            date_str = item.get("date") or ""
-                            ts_ms = _parse_lpt_date_to_ms(date_str)
-                            if ts_ms <= last_ts_ms:
-                                continue
-
-                            msg = (item.get("message") or "").strip()
-                            is_income = bool(item.get("isIncome"))
-
-                            # менеджерские исходящие: isIncome == false
-                            if (not is_income) and msg:
-                                new_outgoing.append((ts_ms, msg))
-
-                        if new_outgoing:
-                            new_outgoing.sort(key=lambda x: x[0])
-                            max_ts = last_ts_ms
-                            for ts, msg in new_outgoing:
-                                await bot.send_message(chat_id=user_id, text=msg)
-                                max_ts = max(max_ts, ts)
-                            if max_ts > last_ts_ms:
-                                set_last_chat_ts_ms(lead_id, max_ts)
-
-        except Exception:
-            # чтобы цикл не умирал
-            pass
-
-        await asyncio.sleep(POLL_SECONDS)
-
-
-async def on_startup(_):
-    asyncio.create_task(lpt_polling_loop())
-
-
 if __name__ == "__main__":
     init_db()
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    executor.start_polling(dp, skip_updates=True)
