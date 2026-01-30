@@ -1,28 +1,21 @@
 import os
-import asyncio
-import logging
 import sqlite3
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatType
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, executor, types
 
-# =======================
-# НАСТРОЙКИ БЕРЁМ ИЗ ПЕРЕМЕННЫХ СРЕДЫ (чтобы не светить токен)
-# =======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GROUP_ID_RAW = os.getenv("GROUP_ID", "").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Добавь его в Variables/Environment.")
+    raise RuntimeError("Не задан BOT_TOKEN. Добавь его в Variables на Railway.")
 if not GROUP_ID_RAW:
-    raise RuntimeError("Не задан GROUP_ID. Добавь его в Variables/Environment.")
+    raise RuntimeError("Не задан GROUP_ID. Добавь его в Variables на Railway.")
 
 GROUP_ID = int(GROUP_ID_RAW)
 
 DB_PATH = "links.sqlite"
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -37,6 +30,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def save_link(group_message_id: int, user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -47,6 +41,7 @@ def save_link(group_message_id: int, user_id: int):
     conn.commit()
     conn.close()
 
+
 def get_user_id_by_group_message_id(group_message_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -56,15 +51,11 @@ def get_user_id_by_group_message_id(group_message_id: int):
     return row[0] if row else None
 
 
-logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
 
-def client_header(user) -> str:
+def client_header(user: types.User) -> str:
     name = (user.full_name or "").strip()
     username = f"@{user.username}" if user.username else "нет"
     return (
@@ -74,13 +65,15 @@ def client_header(user) -> str:
         f"✍️ <i>Ответьте на это сообщение реплаем — бот отправит ответ клиенту.</i>"
     )
 
-@dp.message(F.text == "/id")
-async def cmd_id(message: Message):
+
+@dp.message_handler(commands=["id"])
+async def cmd_id(message: types.Message):
     await message.reply(f"chat_id = <code>{message.chat.id}</code>")
 
-# 1) Клиент -> Группа
-@dp.message(F.chat.type == ChatType.PRIVATE)
-async def from_client_to_group(message: Message):
+
+# 1) Клиент пишет боту в личку -> в группу
+@dp.message_handler(content_types=types.ContentTypes.ANY, chat_type=types.ChatType.PRIVATE)
+async def from_client_to_group(message: types.Message):
     header = client_header(message.from_user)
 
     if message.text:
@@ -91,11 +84,8 @@ async def from_client_to_group(message: Message):
         save_link(sent.message_id, message.from_user.id)
         return
 
-    copied = await bot.copy_message(
-        chat_id=GROUP_ID,
-        from_chat_id=message.chat.id,
-        message_id=message.message_id
-    )
+    # Медиа/файлы: копируем в группу
+    copied = await message.copy_to(chat_id=GROUP_ID)
     save_link(copied.message_id, message.from_user.id)
 
     await bot.send_message(
@@ -104,9 +94,13 @@ async def from_client_to_group(message: Message):
                     "↩️ <b>Ответьте реплаем НА СКОПИРОВАННОЕ вложение</b>, и бот отправит ответ клиенту."
     )
 
-# 2) Группа -> Клиент (только реплаи)
-@dp.message(F.chat.id == GROUP_ID)
-async def from_group_to_client(message: Message):
+
+# 2) В группе: оператор отвечает реплаем -> клиенту
+@dp.message_handler(content_types=types.ContentTypes.ANY)
+async def from_group_to_client(message: types.Message):
+    if message.chat.id != GROUP_ID:
+        return
+
     if not message.reply_to_message:
         return
 
@@ -119,15 +113,9 @@ async def from_group_to_client(message: Message):
         await bot.send_message(chat_id=user_id, text=f"💬 Ответ оператора:\n{message.text}")
         return
 
-    await bot.copy_message(
-        chat_id=user_id,
-        from_chat_id=message.chat.id,
-        message_id=message.message_id
-    )
+    await message.copy_to(chat_id=user_id)
 
-async def main():
-    init_db()
-    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    init_db()
+    executor.start_polling(dp, skip_updates=True)
