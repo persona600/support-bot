@@ -110,7 +110,7 @@ async def from_group_to_client(message: types.Message):
         return
 
     if message.text:
-        await bot.send_message(chat_id=user_id, text=f"💬 Ответ оператора:\n{message.text}")
+        await bot.send_message(chat_id=user_id, text=message.text)
         return
 
     await message.copy_to(chat_id=user_id)
@@ -119,3 +119,4 @@ async def from_group_to_client(message: types.Message):
 if __name__ == "__main__":
     init_db()
     executor.start_polling(dp, skip_updates=True)
+
